@@ -111,7 +111,11 @@ const Window = struct {
 
     // Visual options
     has_border: bool,
-    title: []const u8,
+    default_title: []const u8,
+
+    // Dynamic title from OSC sequences (null = use default_title)
+    dynamic_title_buf: [256]u8 = undefined,
+    dynamic_title_len: usize = 0,
 
     // State
     visible: bool = true,
@@ -143,8 +147,62 @@ const Window = struct {
             .height = height,
             .terminal = terminal,
             .has_border = has_border,
-            .title = title,
+            .default_title = title,
         };
+    }
+
+    fn getTitle(self: *const Window) []const u8 {
+        if (self.dynamic_title_len > 0) {
+            return self.dynamic_title_buf[0..self.dynamic_title_len];
+        }
+        return self.default_title;
+    }
+
+    fn setTitle(self: *Window, title: []const u8) void {
+        const len = @min(title.len, self.dynamic_title_buf.len);
+        @memcpy(self.dynamic_title_buf[0..len], title[0..len]);
+        self.dynamic_title_len = len;
+    }
+
+    fn parseOscTitle(self: *Window, data: []const u8) void {
+        // Look for OSC 0;title ST or OSC 2;title ST sequences
+        // OSC = ESC ] (0x1b 0x5d)
+        // ST = ESC \ (0x1b 0x5c) or BEL (0x07)
+        var i: usize = 0;
+        while (i + 3 < data.len) {
+            if (data[i] == 0x1b and data[i + 1] == ']') {
+                // Found OSC start
+                const cmd_start = i + 2;
+                // Check for 0; or 2; (set window title)
+                if (cmd_start + 1 < data.len and
+                    (data[cmd_start] == '0' or data[cmd_start] == '2') and
+                    data[cmd_start + 1] == ';')
+                {
+                    const title_start = cmd_start + 2;
+                    // Find terminator (BEL or ST)
+                    var title_end: ?usize = null;
+                    var j = title_start;
+                    while (j < data.len) {
+                        if (data[j] == 0x07) {
+                            // BEL terminator
+                            title_end = j;
+                            break;
+                        } else if (j + 1 < data.len and data[j] == 0x1b and data[j + 1] == '\\') {
+                            // ST terminator
+                            title_end = j;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    if (title_end) |end| {
+                        self.setTitle(data[title_start..end]);
+                        i = end;
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
     }
 
     fn deinit(self: *Window, allocator: std.mem.Allocator) void {
@@ -247,11 +305,18 @@ const Window = struct {
         try writer.print("\x1b[{d};{d}H", .{ self.y + 1, self.x + 1 });
         try writer.writeAll(border.top_left);
 
+        // Get the current title (dynamic or default)
+        const title = self.getTitle();
+
         // Calculate title placement (centered)
         const inner_width = self.width -| 2;
-        const title_len: u16 = @intCast(@min(self.title.len, inner_width));
-        const padding_before = (inner_width -| title_len) / 2;
-        const padding_after = inner_width -| title_len -| padding_before;
+        // Account for spaces around title (+2) when calculating available space
+        const max_title_len = if (inner_width > 2) inner_width - 2 else 0;
+        const title_len: u16 = @intCast(@min(title.len, max_title_len));
+        const title_total_width = if (title_len > 0) title_len + 2 else 0; // +2 for spaces
+        const remaining_width = inner_width -| title_total_width;
+        const padding_before = remaining_width / 2;
+        const padding_after = remaining_width -| padding_before;
 
         // Draw horizontal line with title
         var i: u16 = 0;
@@ -260,7 +325,7 @@ const Window = struct {
         }
         if (title_len > 0) {
             try writer.writeAll(" ");
-            try writer.writeAll(self.title[0..title_len]);
+            try writer.writeAll(title[0..title_len]);
             try writer.writeAll(" ");
         }
         i = 0;
@@ -639,6 +704,9 @@ const TermProxy = struct {
                     if (self.forwardTerminalQueries(buf[0..n])) {
                         self.pending_query_pty = floating_pty_fd;
                     }
+
+                    // Parse OSC title sequences to update window title
+                    floating_win.parseOscTitle(buf[0..n]);
 
                     // Update floating window's terminal state
                     try floating_stream.nextSlice(buf[0..n]);
