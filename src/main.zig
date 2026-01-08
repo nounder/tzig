@@ -110,40 +110,6 @@ const Overlay = struct {
     }
 };
 
-// Ring buffer to store recent terminal output for replay
-const OutputBuffer = struct {
-    data: [64 * 1024]u8 = undefined, // 64KB buffer
-    write_pos: usize = 0,
-    len: usize = 0,
-
-    fn append(self: *OutputBuffer, bytes: []const u8) void {
-        for (bytes) |b| {
-            self.data[self.write_pos] = b;
-            self.write_pos = (self.write_pos + 1) % self.data.len;
-            if (self.len < self.data.len) {
-                self.len += 1;
-            }
-        }
-    }
-
-    fn replay(self: *OutputBuffer, writer: anytype) !void {
-        if (self.len == 0) return;
-
-        const start = if (self.len < self.data.len)
-            0
-        else
-            self.write_pos;
-
-        // Write from start to end (handling wrap-around)
-        if (start + self.len <= self.data.len) {
-            try writer.writeAll(self.data[start .. start + self.len]);
-        } else {
-            try writer.writeAll(self.data[start..]);
-            try writer.writeAll(self.data[0..self.write_pos]);
-        }
-    }
-};
-
 const TermProxy = struct {
     master_fd: posix.fd_t,
     child_pid: posix.pid_t,
@@ -152,7 +118,6 @@ const TermProxy = struct {
     original_termios: posix.termios,
     stdout: std.fs.File,
     write_buf: [8192]u8 = undefined,
-    output_buffer: OutputBuffer = .{},
 
     fn init(allocator: std.mem.Allocator) !TermProxy {
         // Get current window size
@@ -292,9 +257,6 @@ const TermProxy = struct {
                 // Update terminal state using ghostty-vt stream
                 try stream.nextSlice(buf[0..n]);
 
-                // Store in output buffer for replay
-                self.output_buffer.append(buf[0..n]);
-
                 // Forward to terminal (if overlay not active)
                 if (!self.overlay.active) {
                     self.stdout.writeAll(buf[0..n]) catch break;
@@ -321,10 +283,8 @@ const TermProxy = struct {
                         try self.overlay.render(&stdout_writer.interface, &self.terminal);
                     } else {
                         try Overlay.hide(&stdout_writer.interface);
-                        // Clear screen and replay buffer to restore colors
-                        try stdout_writer.interface.writeAll("\x1b[H\x1b[2J\x1b[0m");
-                        try stdout_writer.interface.flush();
-                        try self.output_buffer.replay(&stdout_writer.interface);
+                        // Reset attributes - alternate screen restore handles the rest
+                        try stdout_writer.interface.writeAll("\x1b[0m");
                     }
                     try stdout_writer.interface.flush();
                     continue;
@@ -338,10 +298,8 @@ const TermProxy = struct {
                             'q' => {
                                 self.overlay.toggle();
                                 try Overlay.hide(&stdout_writer.interface);
-                                // Clear screen and replay buffer to restore colors
-                                try stdout_writer.interface.writeAll("\x1b[H\x1b[2J\x1b[0m");
-                                try stdout_writer.interface.flush();
-                                try self.output_buffer.replay(&stdout_writer.interface);
+                                // Reset attributes and request shell redraw via SIGWINCH
+                                try stdout_writer.interface.writeAll("\x1b[0m");
                             },
                             'k', 'K' => {
                                 self.overlay.scroll_offset += 1;
