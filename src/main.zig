@@ -105,6 +105,10 @@ const Window = struct {
     // Window's own terminal buffer
     terminal: ghostty_vt.Terminal,
 
+    // Optional PTY for running processes in this window
+    pty_fd: ?posix.fd_t = null,
+    child_pid: ?posix.pid_t = null,
+
     // Visual options
     has_border: bool,
     title: []const u8,
@@ -144,7 +148,80 @@ const Window = struct {
     }
 
     fn deinit(self: *Window, allocator: std.mem.Allocator) void {
+        // Kill child process if running
+        if (self.child_pid) |pid| {
+            _ = std.c.kill(pid, std.posix.SIG.TERM);
+        }
+        // Close PTY
+        if (self.pty_fd) |fd| {
+            posix.close(fd);
+        }
         self.terminal.deinit(allocator);
+    }
+
+    fn spawnShell(self: *Window) !void {
+        // Open PTY
+        const master_fd = posix.open("/dev/ptmx", .{ .ACCMODE = .RDWR, .NOCTTY = true }, 0) catch |err| {
+            return err;
+        };
+        errdefer posix.close(master_fd);
+
+        // Grant and unlock
+        grantpt_wrapper(master_fd);
+        unlockpt_wrapper(master_fd);
+
+        const slave_path = ptsname_wrapper(master_fd);
+
+        // Set window size on master
+        var ws: Winsize = .{
+            .ws_col = self.contentWidth(),
+            .ws_row = self.contentHeight(),
+            .ws_xpixel = 0,
+            .ws_ypixel = 0,
+        };
+        _ = ioctl(master_fd, TIOCSWINSZ, &ws);
+
+        // Fork
+        const fork_result = posix.fork();
+        const pid = fork_result catch |err| {
+            return err;
+        };
+
+        if (pid == 0) {
+            // Child process
+            posix.close(master_fd);
+
+            // Create new session
+            _ = std_c.setsid();
+
+            // Open slave
+            const slave_fd = posix.open(slave_path, .{ .ACCMODE = .RDWR }, 0) catch {
+                posix.exit(1);
+            };
+
+            // Set window size on slave too
+            _ = ioctl(slave_fd, TIOCSWINSZ, &ws);
+
+            // Dup to stdin/stdout/stderr
+            posix.dup2(slave_fd, 0) catch posix.exit(1);
+            posix.dup2(slave_fd, 1) catch posix.exit(1);
+            posix.dup2(slave_fd, 2) catch posix.exit(1);
+
+            if (slave_fd > 2) posix.close(slave_fd);
+
+            // Exec shell with current environment
+            const shell = std.posix.getenv("SHELL") orelse "/bin/sh";
+            const argv = [_:null]?[*:0]const u8{shell};
+
+            // Pass through the current environment
+            const envp = std.c.environ;
+            posix.execvpeZ(shell, &argv, envp) catch posix.exit(1);
+            posix.exit(1);
+        }
+
+        // Parent
+        self.pty_fd = master_fd;
+        self.child_pid = pid;
     }
 
     fn contentWidth(self: *const Window) u16 {
@@ -377,6 +454,9 @@ const TermProxy = struct {
     term_cols: u16,
     term_rows: u16,
 
+    // Track PTY waiting for terminal query response
+    pending_query_pty: ?posix.fd_t = null,
+
     fn init(allocator: std.mem.Allocator) !TermProxy {
         // Get current window size
         var ws: Winsize = undefined;
@@ -474,11 +554,11 @@ const TermProxy = struct {
         const float_x = (ws.ws_col - float_width) / 2;
         const float_y = (ws.ws_row - float_height) / 2;
 
-        const floating_win = try window_manager.createFloatingWindow(float_x, float_y, float_width, float_height, "Floating Window");
+        const floating_win = try window_manager.createFloatingWindow(float_x, float_y, float_width, float_height, "Shell");
         floating_win.visible = false; // Start hidden
 
-        // Write dummy text to the floating window
-        try floating_win.writeContent("Hello from floating window!\r\n\r\nPress Ctrl+] to toggle this window.\r\nPress 'q' to close.\r\n");
+        // Spawn a shell in the floating window
+        try floating_win.spawnShell();
 
         return TermProxy{
             .allocator = allocator,
@@ -509,25 +589,33 @@ const TermProxy = struct {
         self.stdout.writeAll("\x1b[2J\x1b[H") catch {};
 
         // Create vtStream for parsing terminal output (main window)
-        var stream = self.window_manager.main_window.terminal.vtStream();
-        defer stream.deinit();
+        var main_stream = self.window_manager.main_window.terminal.vtStream();
+        defer main_stream.deinit();
+
+        // Get the floating window and create its stream
+        var floating_win = self.window_manager.getFloatingWindow(0).?;
+        var floating_stream = floating_win.terminal.vtStream();
+        defer floating_stream.deinit();
+
+        const floating_pty_fd = floating_win.pty_fd.?;
 
         var pollfds = [_]posix.pollfd{
             .{ .fd = stdin.handle, .events = posix.POLL.IN, .revents = 0 },
             .{ .fd = self.master_fd, .events = posix.POLL.IN, .revents = 0 },
+            .{ .fd = floating_pty_fd, .events = posix.POLL.IN, .revents = 0 },
         };
 
         while (true) {
             const poll_result = posix.poll(&pollfds, -1) catch break;
             if (poll_result == 0) continue;
 
-            // Check for child output
+            // Check for main shell output
             if (pollfds[1].revents & posix.POLL.IN != 0) {
                 const n = posix.read(self.master_fd, &buf) catch break;
                 if (n == 0) break;
 
                 // Update main window's terminal state
-                try stream.nextSlice(buf[0..n]);
+                try main_stream.nextSlice(buf[0..n]);
 
                 if (self.floating_window_visible) {
                     // When floating window visible, we're in alternate screen
@@ -539,30 +627,64 @@ const TermProxy = struct {
                 }
             }
 
+            // Check for floating shell output
+            if (pollfds[2].revents & posix.POLL.IN != 0) {
+                const n = posix.read(floating_pty_fd, &buf) catch {
+                    // Floating shell exited, ignore
+                    continue;
+                };
+                if (n > 0) {
+                    // Forward terminal queries to real terminal
+                    // Responses will come back on stdin and be routed back
+                    if (self.forwardTerminalQueries(buf[0..n])) {
+                        self.pending_query_pty = floating_pty_fd;
+                    }
+
+                    // Update floating window's terminal state
+                    try floating_stream.nextSlice(buf[0..n]);
+
+                    // Re-render if visible
+                    if (self.floating_window_visible) {
+                        try self.renderAll();
+                    }
+                }
+            }
+
             // Check for user input
             if (pollfds[0].revents & posix.POLL.IN != 0) {
                 const n = posix.read(stdin.handle, &buf) catch break;
                 if (n == 0) break;
 
-                // Check for our hotkey - multiple options:
-                // Ctrl+] standard: 0x1d
-                // Ctrl+] kitty protocol: ESC [ 93 ; 5 u
-                // F12: ESC [ 24 ~ or ESC O P (varies by terminal)
+                // Check if this is a terminal response (for forwarded queries)
+                // Terminal responses start with ESC [ and end with specific chars
+                // DA response: ESC [ ? ... c
+                // DSR response: ESC [ ... n or ESC [ ... R
+                if (self.pending_query_pty) |query_pty| {
+                    if (n >= 3 and buf[0] == 0x1b and buf[1] == '[') {
+                        const last = buf[n - 1];
+                        if (last == 'c' or last == 'n' or last == 'R') {
+                            // This is a terminal response, send to the PTY that requested it
+                            _ = posix.write(query_pty, buf[0..n]) catch {};
+                            self.pending_query_pty = null;
+                            continue;
+                        }
+                    }
+                }
+
+                // Check for our hotkey (Ctrl+])
+                // 0x1d = standard encoding
+                // \x1b[93;5u = Kitty keyboard protocol encoding
                 const is_hotkey = (n == 1 and buf[0] == 0x1d) or
-                    (n >= 6 and std.mem.startsWith(u8, buf[0..n], "\x1b[93;5u")) or
-                    (n >= 4 and std.mem.startsWith(u8, buf[0..n], "\x1b[24~")) or // F12
-                    (n >= 5 and std.mem.startsWith(u8, buf[0..n], "\x1bOP")); // F1
+                    (n == 7 and std.mem.eql(u8, buf[0..7], "\x1b[93;5u"));
 
                 if (is_hotkey) {
                     // Toggle floating window visibility
-                    if (self.window_manager.getFloatingWindow(0)) |win| {
-                        win.visible = !win.visible;
-                        self.floating_window_visible = win.visible;
-                    }
+                    floating_win.visible = !floating_win.visible;
+                    self.floating_window_visible = floating_win.visible;
+
                     if (self.floating_window_visible) {
                         // Drain any pending PTY output before opening overlay
-                        // This ensures buffer is up-to-date
-                        try self.drainPtyOutput(&stream);
+                        try self.drainPtyOutput(&main_stream);
                         // Enter alternate screen and render everything
                         try self.enterAlternateScreen();
                         try self.renderAll();
@@ -574,35 +696,25 @@ const TermProxy = struct {
                     continue;
                 }
 
-                // Handle floating window keys when visible
+                // Route input based on which window is focused
                 if (self.floating_window_visible) {
-                    var handled = false;
-                    if (n == 1) {
-                        switch (buf[0]) {
-                            'q', 0x1b => { // q or Escape
-                                // Close floating window
-                                if (self.window_manager.getFloatingWindow(0)) |win| {
-                                    win.visible = false;
-                                    self.floating_window_visible = false;
-                                }
-                                // Render current state, then exit alternate screen
-                                try self.renderMainWindowOnly();
-                                try self.exitAlternateScreen();
-                                handled = true;
-                            },
-                            else => {},
-                        }
-                    }
-                    if (handled) continue;
-                    // Fall through to forward input to shell
+                    // Send input to floating shell
+                    _ = posix.write(floating_pty_fd, buf[0..n]) catch {};
+                } else {
+                    // Send input to main shell
+                    _ = posix.write(self.master_fd, buf[0..n]) catch break;
                 }
-
-                // Forward to shell
-                _ = posix.write(self.master_fd, buf[0..n]) catch break;
             }
 
-            // Check for hangup
+            // Check for main shell hangup
             if (pollfds[1].revents & posix.POLL.HUP != 0) break;
+
+            // Check for floating shell hangup (don't exit, just note it)
+            if (pollfds[2].revents & posix.POLL.HUP != 0) {
+                // Floating shell exited - could respawn or just ignore
+                // For now, disable polling on it by setting fd to -1
+                pollfds[2].fd = -1;
+            }
         }
     }
 
@@ -661,9 +773,9 @@ const TermProxy = struct {
         // Render main window with colors from buffer
         try self.window_manager.main_window.renderWithStyle(&stdout_writer.interface);
 
-        // Render floating windows on top
+        // Render floating windows on top (with colors)
         for (self.window_manager.floating_windows.items) |*win| {
-            try win.render(&stdout_writer.interface);
+            try win.renderWithStyle(&stdout_writer.interface);
         }
 
         // Show cursor
@@ -687,6 +799,58 @@ const TermProxy = struct {
         try stdout_writer.interface.flush();
     }
 
+    fn forwardTerminalQueries(self: *TermProxy, data: []const u8) bool {
+        // Look for terminal queries in the output and forward them to the real terminal
+        // The response will come back on stdin and be routed back to the requesting PTY
+        // Returns true if any query was forwarded
+        var forwarded = false;
+        var i: usize = 0;
+        while (i < data.len) {
+            if (data[i] == 0x1b and i + 1 < data.len and data[i + 1] == '[') {
+                // Check for Primary DA: ESC [ c or ESC [ 0 c
+                if (i + 2 < data.len and data[i + 2] == 'c') {
+                    self.stdout.writeAll("\x1b[c") catch {};
+                    forwarded = true;
+                    i += 3;
+                    continue;
+                }
+                if (i + 3 < data.len and data[i + 2] == '0' and data[i + 3] == 'c') {
+                    self.stdout.writeAll("\x1b[0c") catch {};
+                    forwarded = true;
+                    i += 4;
+                    continue;
+                }
+                // Check for Secondary DA: ESC [ > c or ESC [ > 0 c
+                if (i + 3 < data.len and data[i + 2] == '>' and data[i + 3] == 'c') {
+                    self.stdout.writeAll("\x1b[>c") catch {};
+                    forwarded = true;
+                    i += 4;
+                    continue;
+                }
+                if (i + 4 < data.len and data[i + 2] == '>' and data[i + 3] == '0' and data[i + 4] == 'c') {
+                    self.stdout.writeAll("\x1b[>0c") catch {};
+                    forwarded = true;
+                    i += 5;
+                    continue;
+                }
+                // Check for DSR (Device Status Report): ESC [ 5 n or ESC [ 6 n
+                if (i + 3 < data.len and data[i + 2] == '5' and data[i + 3] == 'n') {
+                    self.stdout.writeAll("\x1b[5n") catch {};
+                    forwarded = true;
+                    i += 4;
+                    continue;
+                }
+                if (i + 3 < data.len and data[i + 2] == '6' and data[i + 3] == 'n') {
+                    self.stdout.writeAll("\x1b[6n") catch {};
+                    forwarded = true;
+                    i += 4;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        return forwarded;
+    }
 };
 
 // PTY helper functions
