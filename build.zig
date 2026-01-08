@@ -7,11 +7,16 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
     const test_step = b.step("test", "Run unit tests");
 
+    // Build options for version info
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", "0.1.0");
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    exe_mod.addOptions("build_options", options);
 
     if (b.lazyDependency("ghostty", .{
         // Disable SIMD for faster builds, smaller binary, no libc dependency

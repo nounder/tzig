@@ -3,6 +3,7 @@ const posix = std.posix;
 const std_c = std.c;
 const builtin = @import("builtin");
 const ghostty_vt = @import("ghostty-vt");
+const cli = @import("cli.zig");
 
 const Winsize = extern struct {
     ws_row: u16,
@@ -17,76 +18,244 @@ const TIOCSWINSZ: c_ulong = if (builtin.os.tag == .macos) 0x80087467 else 0x5414
 
 extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
 
-const Overlay = struct {
-    active: bool = false,
-    scroll_offset: usize = 0,
-
-    fn toggle(self: *Overlay) void {
-        self.active = !self.active;
-        self.scroll_offset = 0;
+// Helper to write SGR style escape sequences
+fn writeStyle(writer: anytype, style: ghostty_vt.Style) !void {
+    // Bold
+    if (style.flags.bold) {
+        try writer.writeAll("\x1b[1m");
+    }
+    // Faint
+    if (style.flags.faint) {
+        try writer.writeAll("\x1b[2m");
+    }
+    // Italic
+    if (style.flags.italic) {
+        try writer.writeAll("\x1b[3m");
+    }
+    // Underline
+    if (style.flags.underline != .none) {
+        switch (style.flags.underline) {
+            .none => {},
+            .single => try writer.writeAll("\x1b[4m"),
+            .double => try writer.writeAll("\x1b[4:2m"),
+            .curly => try writer.writeAll("\x1b[4:3m"),
+            .dotted => try writer.writeAll("\x1b[4:4m"),
+            .dashed => try writer.writeAll("\x1b[4:5m"),
+        }
+    }
+    // Blink
+    if (style.flags.blink) {
+        try writer.writeAll("\x1b[5m");
+    }
+    // Inverse
+    if (style.flags.inverse) {
+        try writer.writeAll("\x1b[7m");
+    }
+    // Invisible
+    if (style.flags.invisible) {
+        try writer.writeAll("\x1b[8m");
+    }
+    // Strikethrough
+    if (style.flags.strikethrough) {
+        try writer.writeAll("\x1b[9m");
     }
 
-    fn render(self: *Overlay, writer: anytype, terminal: *ghostty_vt.Terminal) !void {
-        // Enter alternate screen for overlay
-        try writer.writeAll("\x1b[?1049h");
-        try writer.writeAll("\x1b[H\x1b[2J"); // clear
+    // Foreground color
+    switch (style.fg_color) {
+        .none => {},
+        .palette => |idx| {
+            if (idx < 8) {
+                try writer.print("\x1b[{d}m", .{30 + idx});
+            } else if (idx < 16) {
+                try writer.print("\x1b[{d}m", .{90 + idx - 8});
+            } else {
+                try writer.print("\x1b[38;5;{d}m", .{idx});
+            }
+        },
+        .rgb => |rgb| {
+            try writer.print("\x1b[38;2;{d};{d};{d}m", .{ rgb.r, rgb.g, rgb.b });
+        },
+    }
 
-        const screen = terminal.screens.active;
-        const pages = &screen.pages;
+    // Background color
+    switch (style.bg_color) {
+        .none => {},
+        .palette => |idx| {
+            if (idx < 8) {
+                try writer.print("\x1b[{d}m", .{40 + idx});
+            } else if (idx < 16) {
+                try writer.print("\x1b[{d}m", .{100 + idx - 8});
+            } else {
+                try writer.print("\x1b[48;5;{d}m", .{idx});
+            }
+        },
+        .rgb => |rgb| {
+            try writer.print("\x1b[48;2;{d};{d};{d}m", .{ rgb.r, rgb.g, rgb.b });
+        },
+    }
+}
 
-        // Draw header
-        try writer.writeAll("\x1b[7m"); // reverse video
-        try writer.writeAll(" SCROLLBACK | j/k scroll | q quit ");
-        try writer.writeAll("\x1b[0m\r\n");
+const Window = struct {
+    // Position & dimensions (in terminal cells, 0-indexed)
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
 
-        // Draw scrollback content
-        const max_lines = terminal.rows -| 2;
-        if (max_lines == 0) return;
+    // Window's own terminal buffer
+    terminal: ghostty_vt.Terminal,
 
-        // Get bottom of history (row just before active region)
-        const active_top = pages.getTopLeft(.active);
-        const history_br = active_top.up(1) orelse {
-            try writer.writeAll("\r\n  (no scrollback history yet)\r\n");
-            return;
+    // Visual options
+    has_border: bool,
+    title: []const u8,
+
+    // State
+    visible: bool = true,
+
+    // Border characters (rounded)
+    const border = struct {
+        const top_left = "╭";
+        const top_right = "╮";
+        const bottom_left = "╰";
+        const bottom_right = "╯";
+        const horizontal = "─";
+        const vertical = "│";
+    };
+
+    fn init(allocator: std.mem.Allocator, x: u16, y: u16, width: u16, height: u16, has_border: bool, title: []const u8) !Window {
+        // Content dimensions (inside border if present)
+        const content_cols = if (has_border) width -| 2 else width;
+        const content_rows = if (has_border) height -| 2 else height;
+
+        const terminal: ghostty_vt.Terminal = try .init(allocator, .{
+            .cols = if (content_cols > 0) content_cols else 1,
+            .rows = if (content_rows > 0) content_rows else 1,
+        });
+
+        return Window{
+            .x = x,
+            .y = y,
+            .width = width,
+            .height = height,
+            .terminal = terminal,
+            .has_border = has_border,
+            .title = title,
         };
+    }
 
-        // Get top of history
-        const history_tl = pages.getTopLeft(.history);
+    fn deinit(self: *Window, allocator: std.mem.Allocator) void {
+        self.terminal.deinit(allocator);
+    }
 
-        // Apply scroll offset - start from bottom of history and go up
-        var view_bottom = history_br;
-        var offset_remaining = self.scroll_offset;
-        while (offset_remaining > 0) {
-            if (view_bottom.up(1)) |p| {
-                view_bottom = p;
-                offset_remaining -= 1;
-            } else {
-                break; // Can't scroll any further up
-            }
+    fn contentWidth(self: *const Window) u16 {
+        return if (self.has_border) self.width -| 2 else self.width;
+    }
+
+    fn contentHeight(self: *const Window) u16 {
+        return if (self.has_border) self.height -| 2 else self.height;
+    }
+
+    fn render(self: *const Window, writer: anytype) !void {
+        if (!self.visible) return;
+
+        if (self.has_border) {
+            try self.renderBorder(writer);
+        }
+        try self.renderContent(writer);
+    }
+
+    fn renderBorder(self: *const Window, writer: anytype) !void {
+        // Top border with title
+        // Position cursor (ANSI is 1-indexed)
+        try writer.print("\x1b[{d};{d}H", .{ self.y + 1, self.x + 1 });
+        try writer.writeAll(border.top_left);
+
+        // Calculate title placement (centered)
+        const inner_width = self.width -| 2;
+        const title_len: u16 = @intCast(@min(self.title.len, inner_width));
+        const padding_before = (inner_width -| title_len) / 2;
+        const padding_after = inner_width -| title_len -| padding_before;
+
+        // Draw horizontal line with title
+        var i: u16 = 0;
+        while (i < padding_before) : (i += 1) {
+            try writer.writeAll(border.horizontal);
+        }
+        if (title_len > 0) {
+            try writer.writeAll(" ");
+            try writer.writeAll(self.title[0..title_len]);
+            try writer.writeAll(" ");
+        }
+        i = 0;
+        while (i < padding_after) : (i += 1) {
+            try writer.writeAll(border.horizontal);
+        }
+        try writer.writeAll(border.top_right);
+
+        // Side borders (left and right edges of each row)
+        var row: u16 = 1;
+        while (row < self.height -| 1) : (row += 1) {
+            // Left border
+            try writer.print("\x1b[{d};{d}H", .{ self.y + row + 1, self.x + 1 });
+            try writer.writeAll(border.vertical);
+            // Right border
+            try writer.print("\x1b[{d};{d}H", .{ self.y + row + 1, self.x + self.width });
+            try writer.writeAll(border.vertical);
         }
 
-        // Calculate starting position for display (go up max_lines-1 from view_bottom)
-        var view_top = view_bottom;
-        var lines_available: usize = 1; // view_bottom itself counts as 1
-        var i: usize = 0;
-        while (i < max_lines - 1) : (i += 1) {
-            if (view_top.up(1)) |p| {
-                view_top = p;
-                lines_available += 1;
-            } else {
-                break; // Hit top of history
-            }
+        // Bottom border
+        try writer.print("\x1b[{d};{d}H", .{ self.y + self.height, self.x + 1 });
+        try writer.writeAll(border.bottom_left);
+        i = 0;
+        while (i < inner_width) : (i += 1) {
+            try writer.writeAll(border.horizontal);
         }
+        try writer.writeAll(border.bottom_right);
+    }
 
-        // Use rowIterator to iterate from view_top down to view_bottom
-        var row_it = view_top.rowIterator(.right_down, view_bottom);
-        var lines_shown: usize = 0;
+    fn renderContent(self: *const Window, writer: anytype) !void {
+        try self.renderContentWithStyle(writer, false);
+    }
+
+    fn renderContentWithStyle(self: *const Window, writer: anytype, with_style: bool) !void {
+        const content_x = if (self.has_border) self.x + 1 else self.x;
+        const content_y = if (self.has_border) self.y + 1 else self.y;
+        const content_w = self.contentWidth();
+        const content_h = self.contentHeight();
+
+        const screen = self.terminal.screens.active;
+        const pages = &screen.pages;
+        // Use .viewport to get what's currently visible, not .screen (which is from top of scrollback)
+        const screen_tl = pages.getTopLeft(.viewport);
+
+        var row_it = screen_tl.rowIterator(.right_down, null);
+        var row_idx: u16 = 0;
+
+        // Track last style to minimize escape sequences
+        var last_style_id: u32 = 0;
 
         while (row_it.next()) |pin| {
-            if (lines_shown >= max_lines) break;
+            if (row_idx >= content_h) break;
+
+            // Position cursor for this row
+            try writer.print("\x1b[{d};{d}H", .{ content_y + row_idx + 1, content_x + 1 });
 
             const cells = pin.cells(.all);
-            for (cells) |cell| {
+            var col: u16 = 0;
+            for (cells) |*cell| {
+                if (col >= content_w) break;
+
+                // Handle style changes
+                if (with_style and cell.style_id != last_style_id) {
+                    // Reset and apply new style
+                    try writer.writeAll("\x1b[0m");
+                    if (cell.style_id != 0) {
+                        const style = pin.style(cell);
+                        try writeStyle(writer, style);
+                    }
+                    last_style_id = cell.style_id;
+                }
+
                 const cp = cell.codepoint();
                 if (cp == 0) {
                     try writer.writeByte(' ');
@@ -95,29 +264,118 @@ const Overlay = struct {
                     const len = std.unicode.utf8Encode(cp, &buf) catch 1;
                     try writer.writeAll(buf[0..len]);
                 }
+                col += 1;
             }
-            try writer.writeAll("\r\n");
-            lines_shown += 1;
+
+            // Reset style at end of row and fill remaining columns
+            if (with_style and last_style_id != 0) {
+                try writer.writeAll("\x1b[0m");
+                last_style_id = 0;
+            }
+            while (col < content_w) : (col += 1) {
+                try writer.writeByte(' ');
+            }
+            row_idx += 1;
         }
 
-        // Unused but kept for potential future use
-        _ = history_tl;
+        // Fill remaining rows with spaces
+        while (row_idx < content_h) : (row_idx += 1) {
+            try writer.print("\x1b[{d};{d}H", .{ content_y + row_idx + 1, content_x + 1 });
+            var col: u16 = 0;
+            while (col < content_w) : (col += 1) {
+                try writer.writeByte(' ');
+            }
+        }
+
+        // Ensure we end with reset style
+        if (with_style) {
+            try writer.writeAll("\x1b[0m");
+        }
     }
 
-    fn hide(writer: anytype) !void {
-        // Leave alternate screen
-        try writer.writeAll("\x1b[?1049l");
+    fn renderWithStyle(self: *const Window, writer: anytype) !void {
+        if (!self.visible) return;
+
+        if (self.has_border) {
+            try self.renderBorder(writer);
+        }
+        try self.renderContentWithStyle(writer, true);
+    }
+
+    fn writeContent(self: *Window, data: []const u8) !void {
+        var stream = self.terminal.vtStream();
+        defer stream.deinit();
+        try stream.nextSlice(data);
+    }
+};
+
+const WindowManager = struct {
+    allocator: std.mem.Allocator,
+
+    // Main window (full terminal, no border)
+    main_window: Window,
+
+    // Floating windows (rendered on top)
+    floating_windows: std.ArrayList(Window) = .empty,
+
+    // Terminal dimensions
+    term_cols: u16,
+    term_rows: u16,
+
+    fn init(allocator: std.mem.Allocator, cols: u16, rows: u16) !WindowManager {
+        const main_window = try Window.init(allocator, 0, 0, cols, rows, false, "");
+
+        return WindowManager{
+            .allocator = allocator,
+            .main_window = main_window,
+            .term_cols = cols,
+            .term_rows = rows,
+        };
+    }
+
+    fn deinit(self: *WindowManager) void {
+        for (self.floating_windows.items) |*win| {
+            win.deinit(self.allocator);
+        }
+        self.floating_windows.deinit(self.allocator);
+        self.main_window.deinit(self.allocator);
+    }
+
+    fn createFloatingWindow(self: *WindowManager, x: u16, y: u16, width: u16, height: u16, title: []const u8) !*Window {
+        const window = try Window.init(self.allocator, x, y, width, height, true, title);
+        try self.floating_windows.append(self.allocator, window);
+        return &self.floating_windows.items[self.floating_windows.items.len - 1];
+    }
+
+    fn render(self: *WindowManager, writer: anytype) !void {
+        // First render main window
+        try self.main_window.render(writer);
+
+        // Then render floating windows on top
+        for (self.floating_windows.items) |*win| {
+            try win.render(writer);
+        }
+    }
+
+    fn getFloatingWindow(self: *WindowManager, index: usize) ?*Window {
+        if (index < self.floating_windows.items.len) {
+            return &self.floating_windows.items[index];
+        }
+        return null;
     }
 };
 
 const TermProxy = struct {
+    allocator: std.mem.Allocator,
     master_fd: posix.fd_t,
     child_pid: posix.pid_t,
-    terminal: ghostty_vt.Terminal,
-    overlay: Overlay,
+    window_manager: WindowManager,
+    floating_window_visible: bool = false,
     original_termios: posix.termios,
     stdout: std.fs.File,
     write_buf: [8192]u8 = undefined,
+    term_cols: u16,
+    term_rows: u16,
 
     fn init(allocator: std.mem.Allocator) !TermProxy {
         // Get current window size
@@ -206,38 +464,49 @@ const TermProxy = struct {
 
         try posix.tcsetattr(stdin_fd, .FLUSH, raw);
 
-        // Initialize ghostty terminal
-        const terminal: ghostty_vt.Terminal = try .init(allocator, .{
-            .cols = ws.ws_col,
-            .rows = ws.ws_row,
-        });
-        errdefer terminal.deinit(allocator);
+        // Initialize window manager
+        var window_manager = try WindowManager.init(allocator, ws.ws_col, ws.ws_row);
+        errdefer window_manager.deinit();
+
+        // Create a centered floating window (80% of terminal size)
+        const float_width = (ws.ws_col * 80) / 100;
+        const float_height = (ws.ws_row * 80) / 100;
+        const float_x = (ws.ws_col - float_width) / 2;
+        const float_y = (ws.ws_row - float_height) / 2;
+
+        const floating_win = try window_manager.createFloatingWindow(float_x, float_y, float_width, float_height, "Floating Window");
+        floating_win.visible = false; // Start hidden
+
+        // Write dummy text to the floating window
+        try floating_win.writeContent("Hello from floating window!\r\n\r\nPress Ctrl+] to toggle this window.\r\nPress 'q' to close.\r\n");
 
         return TermProxy{
+            .allocator = allocator,
             .master_fd = master_fd,
             .child_pid = pid,
-            .terminal = terminal,
-            .overlay = Overlay{},
+            .window_manager = window_manager,
             .original_termios = original_termios,
             .stdout = std.fs.File{ .handle = std.posix.STDOUT_FILENO },
+            .term_cols = ws.ws_col,
+            .term_rows = ws.ws_row,
         };
     }
 
-    fn deinit(self: *TermProxy, allocator: std.mem.Allocator) void {
+    fn deinit(self: *TermProxy) void {
         // Restore terminal
         const stdin_fd = std.posix.STDIN_FILENO;
         posix.tcsetattr(stdin_fd, .FLUSH, self.original_termios) catch {};
 
         posix.close(self.master_fd);
-        self.terminal.deinit(allocator);
+        self.window_manager.deinit();
     }
 
     fn run(self: *TermProxy) !void {
         const stdin = std.fs.File{ .handle = std.posix.STDIN_FILENO };
         var buf: [4096]u8 = undefined;
 
-        // Create vtStream for parsing terminal output
-        var stream = self.terminal.vtStream();
+        // Create vtStream for parsing terminal output (main window)
+        var stream = self.window_manager.main_window.terminal.vtStream();
         defer stream.deinit();
 
         var pollfds = [_]posix.pollfd{
@@ -254,11 +523,15 @@ const TermProxy = struct {
                 const n = posix.read(self.master_fd, &buf) catch break;
                 if (n == 0) break;
 
-                // Update terminal state using ghostty-vt stream
+                // Update main window's terminal state
                 try stream.nextSlice(buf[0..n]);
 
-                // Forward to terminal (if overlay not active)
-                if (!self.overlay.active) {
+                if (self.floating_window_visible) {
+                    // When floating window visible, we're in alternate screen
+                    // Re-render everything from buffer
+                    try self.renderAll();
+                } else {
+                    // Pass through directly - preserves colors, cursor, terminal queries
                     self.stdout.writeAll(buf[0..n]) catch break;
                 }
             }
@@ -276,46 +549,49 @@ const TermProxy = struct {
                     (n >= 6 and std.mem.startsWith(u8, buf[0..n], "\x1b[93;5u")) or
                     (n >= 4 and std.mem.startsWith(u8, buf[0..n], "\x1b[24~")) or // F12
                     (n >= 5 and std.mem.startsWith(u8, buf[0..n], "\x1bOP")); // F1
+
                 if (is_hotkey) {
-                    self.overlay.toggle();
-                    var stdout_writer = self.stdout.writer(&self.write_buf);
-                    if (self.overlay.active) {
-                        try self.overlay.render(&stdout_writer.interface, &self.terminal);
-                    } else {
-                        try Overlay.hide(&stdout_writer.interface);
-                        // Reset attributes - alternate screen restore handles the rest
-                        try stdout_writer.interface.writeAll("\x1b[0m");
+                    // Toggle floating window visibility
+                    if (self.window_manager.getFloatingWindow(0)) |win| {
+                        win.visible = !win.visible;
+                        self.floating_window_visible = win.visible;
                     }
-                    try stdout_writer.interface.flush();
+                    if (self.floating_window_visible) {
+                        // Drain any pending PTY output before opening overlay
+                        // This ensures buffer is up-to-date
+                        try self.drainPtyOutput(&stream);
+                        // Enter alternate screen and render everything
+                        try self.enterAlternateScreen();
+                        try self.renderAll();
+                    } else {
+                        // Render current state, then exit alternate screen
+                        try self.renderMainWindowOnly();
+                        try self.exitAlternateScreen();
+                    }
                     continue;
                 }
 
-                // Handle overlay keys
-                if (self.overlay.active) {
+                // Handle floating window keys when visible
+                if (self.floating_window_visible) {
+                    var handled = false;
                     if (n == 1) {
-                        var stdout_writer = self.stdout.writer(&self.write_buf);
                         switch (buf[0]) {
-                            'q' => {
-                                self.overlay.toggle();
-                                try Overlay.hide(&stdout_writer.interface);
-                                // Reset attributes and request shell redraw via SIGWINCH
-                                try stdout_writer.interface.writeAll("\x1b[0m");
-                            },
-                            'k', 'K' => {
-                                self.overlay.scroll_offset += 1;
-                                try self.overlay.render(&stdout_writer.interface, &self.terminal);
-                            },
-                            'j', 'J' => {
-                                if (self.overlay.scroll_offset > 0) {
-                                    self.overlay.scroll_offset -= 1;
+                            'q', 0x1b => { // q or Escape
+                                // Close floating window
+                                if (self.window_manager.getFloatingWindow(0)) |win| {
+                                    win.visible = false;
+                                    self.floating_window_visible = false;
                                 }
-                                try self.overlay.render(&stdout_writer.interface, &self.terminal);
+                                // Render current state, then exit alternate screen
+                                try self.renderMainWindowOnly();
+                                try self.exitAlternateScreen();
+                                handled = true;
                             },
                             else => {},
                         }
-                        try stdout_writer.interface.flush();
                     }
-                    continue;
+                    if (handled) continue;
+                    // Fall through to forward input to shell
                 }
 
                 // Forward to shell
@@ -325,6 +601,87 @@ const TermProxy = struct {
             // Check for hangup
             if (pollfds[1].revents & posix.POLL.HUP != 0) break;
         }
+    }
+
+    fn drainPtyOutput(self: *TermProxy, stream: anytype) !void {
+        var buf: [4096]u8 = undefined;
+        var drain_pollfds = [_]posix.pollfd{
+            .{ .fd = self.master_fd, .events = posix.POLL.IN, .revents = 0 },
+        };
+
+        // Drain pending output with very short timeout (1ms) and max iterations
+        // This catches any buffered output without blocking on continuous streams
+        var iterations: usize = 0;
+        const max_iterations = 5;
+
+        while (iterations < max_iterations) : (iterations += 1) {
+            const poll_result = posix.poll(&drain_pollfds, 1) catch break;
+            if (poll_result == 0) break; // Timeout, no more pending data
+
+            if (drain_pollfds[0].revents & posix.POLL.IN != 0) {
+                const n = posix.read(self.master_fd, &buf) catch break;
+                if (n == 0) break;
+                // Update buffer
+                try stream.nextSlice(buf[0..n]);
+                // Also pass through to real terminal (before we enter alternate)
+                self.stdout.writeAll(buf[0..n]) catch break;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn enterAlternateScreen(self: *TermProxy) !void {
+        var stdout_writer = self.stdout.writer(&self.write_buf);
+        try stdout_writer.interface.writeAll("\x1b[?1049h"); // Enter alternate screen
+        try stdout_writer.interface.flush();
+    }
+
+    fn exitAlternateScreen(self: *TermProxy) !void {
+        var stdout_writer = self.stdout.writer(&self.write_buf);
+        try stdout_writer.interface.writeAll("\x1b[?1049l"); // Exit alternate screen
+        try stdout_writer.interface.flush();
+
+        // Send SIGWINCH to child to force shell/program to redraw
+        // This ensures our buffer gets updated with fresh content
+        _ = std.c.kill(self.child_pid, std.posix.SIG.WINCH);
+    }
+
+    fn renderAll(self: *TermProxy) !void {
+        var stdout_writer = self.stdout.writer(&self.write_buf);
+
+        // Hide cursor during rendering
+        try stdout_writer.interface.writeAll("\x1b[?25l");
+        // Clear screen and home cursor
+        try stdout_writer.interface.writeAll("\x1b[H\x1b[2J");
+
+        // Render main window with colors from buffer
+        try self.window_manager.main_window.renderWithStyle(&stdout_writer.interface);
+
+        // Render floating windows on top
+        for (self.window_manager.floating_windows.items) |*win| {
+            try win.render(&stdout_writer.interface);
+        }
+
+        // Show cursor
+        try stdout_writer.interface.writeAll("\x1b[?25h");
+        try stdout_writer.interface.flush();
+    }
+
+    fn renderMainWindowOnly(self: *TermProxy) !void {
+        var stdout_writer = self.stdout.writer(&self.write_buf);
+
+        // Hide cursor during rendering
+        try stdout_writer.interface.writeAll("\x1b[?25l");
+        // Clear screen and home cursor
+        try stdout_writer.interface.writeAll("\x1b[H\x1b[2J");
+
+        // Render main window with colors from buffer
+        try self.window_manager.main_window.renderWithStyle(&stdout_writer.interface);
+
+        // Show cursor
+        try stdout_writer.interface.writeAll("\x1b[?25h");
+        try stdout_writer.interface.flush();
     }
 
 };
@@ -347,13 +704,60 @@ fn ptsname_wrapper(fd: posix.fd_t) [:0]const u8 {
     return std.mem.span(ptr);
 }
 
-pub fn main() !void {
+pub fn main() !u8 {
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [1024]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    const stdout = &stdout_writer.interface;
+    const stderr = &stderr_writer.interface;
+
+    // Parse CLI arguments
+    const args = std.process.argsAlloc(std.heap.page_allocator) catch {
+        stderr.writeAll("error: failed to allocate arguments\n") catch {};
+        stderr.flush() catch {};
+        return 1;
+    };
+    defer std.process.argsFree(std.heap.page_allocator, args);
+
+    const action = cli.parse(args[1..]) catch {
+        stderr.writeAll("error: invalid argument\n") catch {};
+        stderr.writeAll("Try 'tzig --help' for more information.\n") catch {};
+        stderr.flush() catch {};
+        return 1;
+    };
+
+    switch (action) {
+        .version => {
+            cli.printVersion(stdout) catch return 1;
+            stdout.flush() catch {};
+            return 0;
+        },
+        .help => {
+            cli.printHelp(stdout) catch return 1;
+            stdout.flush() catch {};
+            return 0;
+        },
+        .run => {},
+    }
+
+    // Run the terminal proxy
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var proxy = try TermProxy.init(allocator);
-    defer proxy.deinit(allocator);
+    var proxy = TermProxy.init(allocator) catch |err| {
+        stderr.print("error: failed to initialize terminal: {}\n", .{err}) catch {};
+        stderr.flush() catch {};
+        return 1;
+    };
+    defer proxy.deinit();
 
-    try proxy.run();
+    proxy.run() catch |err| {
+        stderr.print("error: {}\n", .{err}) catch {};
+        stderr.flush() catch {};
+        return 1;
+    };
+
+    return 0;
 }
