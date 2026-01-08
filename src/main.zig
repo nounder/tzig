@@ -505,6 +505,9 @@ const TermProxy = struct {
         const stdin = std.fs.File{ .handle = std.posix.STDIN_FILENO };
         var buf: [4096]u8 = undefined;
 
+        // Clear screen and move cursor to top-left so everything starts fresh
+        self.stdout.writeAll("\x1b[2J\x1b[H") catch {};
+
         // Create vtStream for parsing terminal output (main window)
         var stream = self.window_manager.main_window.terminal.vtStream();
         defer stream.deinit();
