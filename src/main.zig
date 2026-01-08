@@ -778,6 +778,19 @@ const TermProxy = struct {
             try win.renderWithStyle(&stdout_writer.interface);
         }
 
+        // Position cursor at the focused window's cursor position
+        if (self.floating_window_visible) {
+            if (self.window_manager.getFloatingWindow(0)) |win| {
+                const screen = win.terminal.screens.active;
+                const cursor_x = screen.cursor.x;
+                const cursor_y = screen.cursor.y;
+                // Calculate absolute position (window position + border + cursor offset)
+                const abs_x = win.x + (if (win.has_border) @as(u16, 1) else 0) + cursor_x + 1; // +1 for ANSI 1-indexed
+                const abs_y = win.y + (if (win.has_border) @as(u16, 1) else 0) + cursor_y + 1;
+                try stdout_writer.interface.print("\x1b[{d};{d}H", .{ abs_y, abs_x });
+            }
+        }
+
         // Show cursor
         try stdout_writer.interface.writeAll("\x1b[?25h");
         try stdout_writer.interface.flush();
