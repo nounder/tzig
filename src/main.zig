@@ -1,5 +1,12 @@
 const std = @import("std");
 const posix = std.posix;
+
+/// Override default log levels to suppress ghostty-vt stream warnings
+pub const std_options: std.Options = .{
+    .log_scope_levels = &.{
+        .{ .scope = .stream, .level = .err },
+    },
+};
 const std_c = std.c;
 const builtin = @import("builtin");
 const ghostty_vt = @import("ghostty-vt");
