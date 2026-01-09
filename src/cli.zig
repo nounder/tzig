@@ -33,12 +33,22 @@ pub fn parse(args: []const [:0]const u8) Error!Action {
 
 /// Print version information to stdout.
 pub fn printVersion(writer: anytype) !void {
-    try writer.print("tzig {s}\n", .{build_options.version});
-    try writer.print("\nBuild Info\n", .{});
-    try writer.print("  Zig version: {s}\n", .{builtin.zig_version_string});
-    try writer.print("  Build mode:  {s}\n", .{@tagName(builtin.mode)});
-    try writer.print("  OS:         {s}\n", .{@tagName(builtin.os.tag)});
-    try writer.print("  Arch:       {s}\n", .{@tagName(builtin.cpu.arch)});
+    try writer.print(
+        \\tzig {s}
+        \\
+        \\Build Info
+        \\  Zig version: {s}
+        \\  Build mode:  {s}
+        \\  OS:         {s}
+        \\  Arch:       {s}
+        \\
+    , .{
+        build_options.version,
+        builtin.zig_version_string,
+        @tagName(builtin.mode),
+        @tagName(builtin.os.tag),
+        @tagName(builtin.cpu.arch),
+    });
 }
 
 /// Print help information to stdout.

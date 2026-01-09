@@ -4,6 +4,26 @@ const std_c = std.c;
 const builtin = @import("builtin");
 const ghostty_vt = @import("ghostty-vt");
 const cli = @import("cli.zig");
+const VTHandler = @import("vt.zig").VTHandler;
+
+/// Context for floating window VT stream.
+/// Handles window title changes and forwards device queries to real terminal.
+const FloatingWindowContext = struct {
+    window: *Window,
+    proxy: *TermProxy,
+
+    pub fn onWindowTitle(self: *FloatingWindowContext, title: []const u8) void {
+        self.window.setTitle(title);
+    }
+
+    pub fn onDeviceQuery(self: *FloatingWindowContext) void {
+        // Forward DA query to real terminal, track which PTY to send response to
+        self.proxy.stdout.writeAll("\x1b[c") catch {};
+        if (self.window.pty_fd) |fd| {
+            self.proxy.pending_query_pty = fd;
+        }
+    }
+};
 
 const Winsize = extern struct {
     ws_row: u16,
@@ -162,47 +182,6 @@ const Window = struct {
         const len = @min(title.len, self.dynamic_title_buf.len);
         @memcpy(self.dynamic_title_buf[0..len], title[0..len]);
         self.dynamic_title_len = len;
-    }
-
-    fn parseOscTitle(self: *Window, data: []const u8) void {
-        // Look for OSC 0;title ST or OSC 2;title ST sequences
-        // OSC = ESC ] (0x1b 0x5d)
-        // ST = ESC \ (0x1b 0x5c) or BEL (0x07)
-        var i: usize = 0;
-        while (i + 3 < data.len) {
-            if (data[i] == 0x1b and data[i + 1] == ']') {
-                // Found OSC start
-                const cmd_start = i + 2;
-                // Check for 0; or 2; (set window title)
-                if (cmd_start + 1 < data.len and
-                    (data[cmd_start] == '0' or data[cmd_start] == '2') and
-                    data[cmd_start + 1] == ';')
-                {
-                    const title_start = cmd_start + 2;
-                    // Find terminator (BEL or ST)
-                    var title_end: ?usize = null;
-                    var j = title_start;
-                    while (j < data.len) {
-                        if (data[j] == 0x07) {
-                            // BEL terminator
-                            title_end = j;
-                            break;
-                        } else if (j + 1 < data.len and data[j] == 0x1b and data[j + 1] == '\\') {
-                            // ST terminator
-                            title_end = j;
-                            break;
-                        }
-                        j += 1;
-                    }
-                    if (title_end) |end| {
-                        self.setTitle(data[title_start..end]);
-                        i = end;
-                        continue;
-                    }
-                }
-            }
-            i += 1;
-        }
     }
 
     fn deinit(self: *Window, allocator: std.mem.Allocator) void {
@@ -443,12 +422,6 @@ const Window = struct {
         }
         try self.renderContentWithStyle(writer, true);
     }
-
-    fn writeContent(self: *Window, data: []const u8) !void {
-        var stream = self.terminal.vtStream();
-        defer stream.deinit();
-        try stream.nextSlice(data);
-    }
 };
 
 const WindowManager = struct {
@@ -654,12 +627,24 @@ const TermProxy = struct {
         self.stdout.writeAll("\x1b[2J\x1b[H") catch {};
 
         // Create vtStream for parsing terminal output (main window)
+        // Main window uses simple ReadonlyStream - queries passthrough to real terminal
         var main_stream = self.window_manager.main_window.terminal.vtStream();
         defer main_stream.deinit();
 
-        // Get the floating window and create its stream
+        // Get the floating window and create its stream with our extended handler
+        // This handler intercepts title changes and device queries while delegating
+        // all terminal state modifications to ReadonlyHandler
         var floating_win = self.window_manager.getFloatingWindow(0).?;
-        var floating_stream = floating_win.terminal.vtStream();
+        var floating_ctx = FloatingWindowContext{
+            .window = floating_win,
+            .proxy = self,
+        };
+        const FloatingHandler = VTHandler(FloatingWindowContext);
+        const FloatingStream = ghostty_vt.Stream(FloatingHandler);
+        var floating_stream: FloatingStream = .initAlloc(
+            self.allocator,
+            FloatingHandler.init(&floating_win.terminal, &floating_ctx),
+        );
         defer floating_stream.deinit();
 
         const floating_pty_fd = floating_win.pty_fd.?;
@@ -699,16 +684,10 @@ const TermProxy = struct {
                     continue;
                 };
                 if (n > 0) {
-                    // Forward terminal queries to real terminal
-                    // Responses will come back on stdin and be routed back
-                    if (self.forwardTerminalQueries(buf[0..n])) {
-                        self.pending_query_pty = floating_pty_fd;
-                    }
-
-                    // Parse OSC title sequences to update window title
-                    floating_win.parseOscTitle(buf[0..n]);
-
                     // Update floating window's terminal state
+                    // VTHandler automatically handles:
+                    // - Title changes (window_title action -> onWindowTitle)
+                    // - Device queries (device_attributes action -> onDeviceQuery)
                     try floating_stream.nextSlice(buf[0..n]);
 
                     // Re-render if visible
@@ -878,59 +857,6 @@ const TermProxy = struct {
         // Show cursor
         try stdout_writer.interface.writeAll("\x1b[?25h");
         try stdout_writer.interface.flush();
-    }
-
-    fn forwardTerminalQueries(self: *TermProxy, data: []const u8) bool {
-        // Look for terminal queries in the output and forward them to the real terminal
-        // The response will come back on stdin and be routed back to the requesting PTY
-        // Returns true if any query was forwarded
-        var forwarded = false;
-        var i: usize = 0;
-        while (i < data.len) {
-            if (data[i] == 0x1b and i + 1 < data.len and data[i + 1] == '[') {
-                // Check for Primary DA: ESC [ c or ESC [ 0 c
-                if (i + 2 < data.len and data[i + 2] == 'c') {
-                    self.stdout.writeAll("\x1b[c") catch {};
-                    forwarded = true;
-                    i += 3;
-                    continue;
-                }
-                if (i + 3 < data.len and data[i + 2] == '0' and data[i + 3] == 'c') {
-                    self.stdout.writeAll("\x1b[0c") catch {};
-                    forwarded = true;
-                    i += 4;
-                    continue;
-                }
-                // Check for Secondary DA: ESC [ > c or ESC [ > 0 c
-                if (i + 3 < data.len and data[i + 2] == '>' and data[i + 3] == 'c') {
-                    self.stdout.writeAll("\x1b[>c") catch {};
-                    forwarded = true;
-                    i += 4;
-                    continue;
-                }
-                if (i + 4 < data.len and data[i + 2] == '>' and data[i + 3] == '0' and data[i + 4] == 'c') {
-                    self.stdout.writeAll("\x1b[>0c") catch {};
-                    forwarded = true;
-                    i += 5;
-                    continue;
-                }
-                // Check for DSR (Device Status Report): ESC [ 5 n or ESC [ 6 n
-                if (i + 3 < data.len and data[i + 2] == '5' and data[i + 3] == 'n') {
-                    self.stdout.writeAll("\x1b[5n") catch {};
-                    forwarded = true;
-                    i += 4;
-                    continue;
-                }
-                if (i + 3 < data.len and data[i + 2] == '6' and data[i + 3] == 'n') {
-                    self.stdout.writeAll("\x1b[6n") catch {};
-                    forwarded = true;
-                    i += 4;
-                    continue;
-                }
-            }
-            i += 1;
-        }
-        return forwarded;
     }
 };
 
