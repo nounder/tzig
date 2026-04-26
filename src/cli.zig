@@ -63,9 +63,14 @@ pub fn printHelp(writer: anytype) !void {
         \\  -V, --version  Show version information and exit
         \\
         \\Hotkeys (while running):
-        \\  Ctrl+]         Toggle scrollback overlay
-        \\  j/k            Scroll down/up in overlay
-        \\  q              Exit overlay
+        \\  Ctrl+b [       Enter scrollback mode
+        \\  Ctrl+]         Toggle floating pane
+        \\
+        \\Scrollback mode:
+        \\  j/k            Scroll down/up one line
+        \\  Ctrl+d/u       Scroll down/up half page
+        \\  g/G            Go to top/bottom
+        \\  q, Escape      Exit scrollback mode
         \\
     );
 }

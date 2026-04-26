@@ -502,6 +502,10 @@ const TermProxy = struct {
     // Track PTY waiting for terminal query response
     pending_query_pty: ?posix.fd_t = null,
 
+    // Scrollback mode state
+    waiting_for_prefix_key: bool = false, // Waiting for second key after Ctrl+b
+    in_scrollback_mode: bool = false, // Currently viewing scrollback
+
     fn init(allocator: std.mem.Allocator) !TermProxy {
         // Get current window size
         var ws: Winsize = undefined;
@@ -725,6 +729,34 @@ const TermProxy = struct {
                     }
                 }
 
+                // Handle scrollback mode input
+                if (self.in_scrollback_mode) {
+                    if (try self.handleScrollbackInput(buf[0..n])) {
+                        continue;
+                    }
+                }
+
+                // Check for Ctrl+b prefix (0x02)
+                if (n == 1 and buf[0] == 0x02) {
+                    self.waiting_for_prefix_key = true;
+                    continue;
+                }
+
+                // Check for second key after Ctrl+b
+                if (self.waiting_for_prefix_key) {
+                    self.waiting_for_prefix_key = false;
+                    if (n == 1 and buf[0] == '[') {
+                        // Ctrl+b [ - Enter scrollback mode
+                        if (!self.in_scrollback_mode and !self.floating_window_visible) {
+                            try self.enterScrollbackMode();
+                        }
+                        continue;
+                    }
+                    // Not '[', send the Ctrl+b and the key to the shell
+                    _ = posix.write(self.master_fd, &[_]u8{0x02}) catch break;
+                    // Fall through to send the current key
+                }
+
                 // Check for our hotkey (Ctrl+])
                 // 0x1d = standard encoding
                 // \x1b[93;5u = Kitty keyboard protocol encoding
@@ -863,6 +895,109 @@ const TermProxy = struct {
 
         // Show cursor
         try stdout_writer.interface.writeAll("\x1b[?25h");
+        try stdout_writer.interface.flush();
+    }
+
+    fn enterScrollbackMode(self: *TermProxy) !void {
+        self.in_scrollback_mode = true;
+
+        // Scroll viewport to top of scrollback
+        const terminal = &self.window_manager.main_window.terminal;
+        try terminal.scrollViewport(.top);
+
+        // Enter alternate screen and render
+        try self.enterAlternateScreen();
+        try self.renderScrollback();
+    }
+
+    fn exitScrollbackMode(self: *TermProxy) !void {
+        self.in_scrollback_mode = false;
+
+        // Scroll viewport back to bottom (active area)
+        const terminal = &self.window_manager.main_window.terminal;
+        try terminal.scrollViewport(.bottom);
+
+        // Exit alternate screen - shell will redraw
+        try self.exitAlternateScreen();
+    }
+
+    fn handleScrollbackInput(self: *TermProxy, input: []const u8) !bool {
+        if (input.len == 0) return false;
+
+        const terminal = &self.window_manager.main_window.terminal;
+
+        // Single character commands
+        if (input.len == 1) {
+            switch (input[0]) {
+                'q', 0x1b => { // q or Escape - exit scrollback
+                    try self.exitScrollbackMode();
+                    return true;
+                },
+                'j' => { // Scroll down one line
+                    try terminal.scrollViewport(.{ .delta = 1 });
+                    try self.renderScrollback();
+                    return true;
+                },
+                'k' => { // Scroll up one line
+                    try terminal.scrollViewport(.{ .delta = -1 });
+                    try self.renderScrollback();
+                    return true;
+                },
+                'g' => { // Go to top
+                    try terminal.scrollViewport(.top);
+                    try self.renderScrollback();
+                    return true;
+                },
+                'G' => { // Go to bottom
+                    try terminal.scrollViewport(.bottom);
+                    try self.renderScrollback();
+                    return true;
+                },
+                0x04 => { // Ctrl+d - half page down
+                    const half_page: isize = @intCast(self.term_rows / 2);
+                    try terminal.scrollViewport(.{ .delta = half_page });
+                    try self.renderScrollback();
+                    return true;
+                },
+                0x15 => { // Ctrl+u - half page up
+                    const half_page: isize = @intCast(self.term_rows / 2);
+                    try terminal.scrollViewport(.{ .delta = -half_page });
+                    try self.renderScrollback();
+                    return true;
+                },
+                else => return true, // Consume but ignore other single chars
+            }
+        }
+
+        // Consume all input in scrollback mode
+        return true;
+    }
+
+    fn renderScrollback(self: *TermProxy) !void {
+        var stdout_writer = self.stdout.writer(&self.write_buf);
+
+        // Hide cursor during rendering
+        try stdout_writer.interface.writeAll("\x1b[?25l");
+        // Clear screen and home cursor
+        try stdout_writer.interface.writeAll("\x1b[H\x1b[2J");
+
+        // Render the viewport content from the terminal
+        try self.window_manager.main_window.renderWithStyle(&stdout_writer.interface);
+
+        // Draw status line at bottom showing position
+        const screen = self.window_manager.main_window.terminal.screens.active;
+        const at_bottom = screen.viewportIsBottom();
+
+        try stdout_writer.interface.print("\x1b[{d};1H", .{self.term_rows}); // Move to last row
+        try stdout_writer.interface.writeAll("\x1b[7m"); // Reverse video
+        if (at_bottom) {
+            try stdout_writer.interface.writeAll(" [scrollback: BOTTOM] q=exit j/k=scroll Ctrl+u/d=page g/G=top/bottom ");
+        } else {
+            try stdout_writer.interface.writeAll(" [scrollback] q=exit j/k=scroll Ctrl+u/d=page g/G=top/bottom ");
+        }
+        try stdout_writer.interface.writeAll("\x1b[0m"); // Reset
+
+        // Keep cursor hidden in scrollback mode
         try stdout_writer.interface.flush();
     }
 };
