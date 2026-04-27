@@ -13,6 +13,19 @@ const ghostty_vt = @import("ghostty-vt");
 const cli = @import("cli.zig");
 const VTHandler = @import("vt.zig").VTHandler;
 
+/// Wraps a raw fd in `std.Io.File` and closes it via the Io.
+fn closeFd(io: std.Io, fd: posix.fd_t) void {
+    var f: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    f.close(io);
+}
+
+/// Writes all bytes to a raw fd via `std.Io.File`. Errors are silently ignored
+/// at call sites that previously discarded `posix.write` results.
+fn writeAllFd(io: std.Io, fd: posix.fd_t, bytes: []const u8) !void {
+    var f: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    try f.writeStreamingAll(io, bytes);
+}
+
 /// Context for floating window VT stream.
 /// Handles window title changes and forwards device queries to real terminal.
 const FloatingWindowContext = struct {
@@ -25,7 +38,7 @@ const FloatingWindowContext = struct {
 
     pub fn onDeviceQuery(self: *FloatingWindowContext) void {
         // Forward DA query to real terminal, track which PTY to send response to
-        self.proxy.stdout.writeAll("\x1b[c") catch {};
+        self.proxy.stdout.writeStreamingAll(self.proxy.io, "\x1b[c") catch {};
         if (self.window.pty_fd) |fd| {
             self.proxy.pending_query_pty = fd;
         }
@@ -191,24 +204,24 @@ const Window = struct {
         self.dynamic_title_len = len;
     }
 
-    fn deinit(self: *Window, allocator: std.mem.Allocator) void {
+    fn deinit(self: *Window, io: std.Io, allocator: std.mem.Allocator) void {
         // Kill child process if running
         if (self.child_pid) |pid| {
             _ = std.c.kill(pid, std.posix.SIG.TERM);
         }
         // Close PTY
         if (self.pty_fd) |fd| {
-            posix.close(fd);
+            closeFd(io, fd);
         }
         self.terminal.deinit(allocator);
     }
 
-    fn spawnShell(self: *Window) !void {
-        // Open PTY
-        const master_fd = posix.open("/dev/ptmx", .{ .ACCMODE = .RDWR, .NOCTTY = true }, 0) catch |err| {
-            return err;
-        };
-        errdefer posix.close(master_fd);
+    fn spawnShell(self: *Window, io: std.Io) !void {
+        // Open PTY. `allow_ctty=false` is the default and corresponds to
+        // O_NOCTTY at the syscall layer.
+        const master_file = try std.Io.Dir.openFileAbsolute(io, "/dev/ptmx", .{ .mode = .read_write });
+        const master_fd = master_file.handle;
+        errdefer closeFd(io, master_fd);
 
         // Grant and unlock
         grantpt_wrapper(master_fd);
@@ -225,47 +238,44 @@ const Window = struct {
         };
         _ = ioctl(master_fd, TIOCSWINSZ, &ws);
 
-        // Fork
-        const fork_result = posix.fork();
-        const pid = fork_result catch |err| {
-            return err;
-        };
+        // Fork. `std.posix.fork` was removed in 0.16; drop to libc.
+        const pid_c = std.c.fork();
+        if (pid_c < 0) return error.ForkFailed;
 
-        if (pid == 0) {
-            // Child process
-            posix.close(master_fd);
+        if (pid_c == 0) {
+            // Child process. Stick to raw libc here — no Io.File / allocator
+            // interaction across fork is the only safe choice.
+            _ = std.c.close(master_fd);
 
             // Create new session
             _ = std_c.setsid();
 
             // Open slave
-            const slave_fd = posix.open(slave_path, .{ .ACCMODE = .RDWR }, 0) catch {
-                posix.exit(1);
-            };
+            const slave_fd = std.c.open(slave_path.ptr, .{ .ACCMODE = .RDWR });
+            if (slave_fd < 0) std.c._exit(1);
 
             // Set window size on slave too
             _ = ioctl(slave_fd, TIOCSWINSZ, &ws);
 
             // Dup to stdin/stdout/stderr
-            posix.dup2(slave_fd, 0) catch posix.exit(1);
-            posix.dup2(slave_fd, 1) catch posix.exit(1);
-            posix.dup2(slave_fd, 2) catch posix.exit(1);
+            if (std.c.dup2(slave_fd, 0) < 0) std.c._exit(1);
+            if (std.c.dup2(slave_fd, 1) < 0) std.c._exit(1);
+            if (std.c.dup2(slave_fd, 2) < 0) std.c._exit(1);
 
-            if (slave_fd > 2) posix.close(slave_fd);
+            if (slave_fd > 2) _ = std.c.close(slave_fd);
 
-            // Exec shell with current environment
-            const shell = std.posix.getenv("SHELL") orelse "/bin/sh";
-            const argv = [_:null]?[*:0]const u8{shell};
-
-            // Pass through the current environment
-            const envp = std.c.environ;
-            posix.execvpeZ(shell, &argv, envp) catch posix.exit(1);
-            posix.exit(1);
+            // Exec shell with current environment. We don't have execvpe in
+            // 0.16 stdlib; SHELL is virtually always an absolute path.
+            const shell_z: [*:0]const u8 = std.c.getenv("SHELL") orelse "/bin/sh";
+            const argv = [_:null]?[*:0]const u8{shell_z};
+            const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+            _ = std.c.execve(shell_z, &argv, envp);
+            std.c._exit(1);
         }
 
         // Parent
         self.pty_fd = master_fd;
-        self.child_pid = pid;
+        self.child_pid = @intCast(pid_c);
     }
 
     fn contentWidth(self: *const Window) u16 {
@@ -455,12 +465,12 @@ const WindowManager = struct {
         };
     }
 
-    fn deinit(self: *WindowManager) void {
+    fn deinit(self: *WindowManager, io: std.Io) void {
         for (self.floating_windows.items) |*win| {
-            win.deinit(self.allocator);
+            win.deinit(io, self.allocator);
         }
         self.floating_windows.deinit(self.allocator);
-        self.main_window.deinit(self.allocator);
+        self.main_window.deinit(io, self.allocator);
     }
 
     fn createFloatingWindow(self: *WindowManager, x: u16, y: u16, width: u16, height: u16, title: []const u8) !*Window {
@@ -488,13 +498,14 @@ const WindowManager = struct {
 };
 
 const TermProxy = struct {
+    io: std.Io,
     allocator: std.mem.Allocator,
     master_fd: posix.fd_t,
     child_pid: posix.pid_t,
     window_manager: WindowManager,
     floating_window_visible: bool = false,
     original_termios: posix.termios,
-    stdout: std.fs.File,
+    stdout: std.Io.File,
     write_buf: [8192]u8 = undefined,
     term_cols: u16,
     term_rows: u16,
@@ -506,22 +517,23 @@ const TermProxy = struct {
     waiting_for_prefix_key: bool = false, // Waiting for second key after Ctrl+b
     in_scrollback_mode: bool = false, // Currently viewing scrollback
 
-    fn init(allocator: std.mem.Allocator) !TermProxy {
+    fn init(io: std.Io, allocator: std.mem.Allocator) !TermProxy {
         // Get current window size
         var ws: Winsize = undefined;
-        const stdout_fd = std.posix.STDOUT_FILENO;
+        const stdout_fd = std.Io.File.stdout().handle;
 
         const ws_result = ioctl(stdout_fd, TIOCGWINSZ, &ws);
         if (ws_result != 0) {
             ws = .{ .ws_row = 24, .ws_col = 80, .ws_xpixel = 0, .ws_ypixel = 0 };
         }
 
-        // Open PTY
-        const master_fd = posix.open("/dev/ptmx", .{ .ACCMODE = .RDWR, .NOCTTY = true }, 0) catch |err| {
+        // Open PTY. Default `allow_ctty = false` corresponds to O_NOCTTY.
+        const master_file = std.Io.Dir.openFileAbsolute(io, "/dev/ptmx", .{ .mode = .read_write }) catch |err| {
             std.debug.print("Failed to open /dev/ptmx: {}\n", .{err});
             return err;
         };
-        errdefer posix.close(master_fd);
+        const master_fd = master_file.handle;
+        errdefer closeFd(io, master_fd);
 
         // Grant and unlock
         grantpt_wrapper(master_fd);
@@ -532,47 +544,41 @@ const TermProxy = struct {
         // Set window size on master
         _ = ioctl(master_fd, TIOCSWINSZ, &ws);
 
-        // Fork
-        const fork_result = posix.fork();
-        const pid = fork_result catch |err| {
-            std.debug.print("Fork failed: {}\n", .{err});
-            return err;
-        };
+        // Fork. `std.posix.fork` was removed in 0.16; drop to libc.
+        const pid_c = std.c.fork();
+        if (pid_c < 0) return error.ForkFailed;
 
-        if (pid == 0) {
-            // Child process
-            posix.close(master_fd);
+        if (pid_c == 0) {
+            // Child process. Stick to raw libc here — fork-safety.
+            _ = std.c.close(master_fd);
 
             // Create new session
             _ = std_c.setsid();
 
             // Open slave
-            const slave_fd = posix.open(slave_path, .{ .ACCMODE = .RDWR }, 0) catch {
-                posix.exit(1);
-            };
+            const slave_fd = std.c.open(slave_path.ptr, .{ .ACCMODE = .RDWR });
+            if (slave_fd < 0) std.c._exit(1);
 
             // Set window size on slave too
             _ = ioctl(slave_fd, TIOCSWINSZ, &ws);
 
             // Dup to stdin/stdout/stderr
-            posix.dup2(slave_fd, 0) catch posix.exit(1);
-            posix.dup2(slave_fd, 1) catch posix.exit(1);
-            posix.dup2(slave_fd, 2) catch posix.exit(1);
+            if (std.c.dup2(slave_fd, 0) < 0) std.c._exit(1);
+            if (std.c.dup2(slave_fd, 1) < 0) std.c._exit(1);
+            if (std.c.dup2(slave_fd, 2) < 0) std.c._exit(1);
 
-            if (slave_fd > 2) posix.close(slave_fd);
+            if (slave_fd > 2) _ = std.c.close(slave_fd);
 
             // Exec shell with current environment
-            const shell = std.posix.getenv("SHELL") orelse "/bin/sh";
-            const argv = [_:null]?[*:0]const u8{shell};
-
-            // Pass through the current environment
-            const envp = std.c.environ;
-            posix.execvpeZ(shell, &argv, envp) catch posix.exit(1);
-            posix.exit(1);
+            const shell_z: [*:0]const u8 = std.c.getenv("SHELL") orelse "/bin/sh";
+            const argv = [_:null]?[*:0]const u8{shell_z};
+            const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+            _ = std.c.execve(shell_z, &argv, envp);
+            std.c._exit(1);
         }
 
         // Parent: set terminal to raw mode
-        const stdin_fd = std.posix.STDIN_FILENO;
+        const stdin_fd = std.Io.File.stdin().handle;
         const original_termios = try posix.tcgetattr(stdin_fd);
         var raw = original_termios;
 
@@ -595,7 +601,7 @@ const TermProxy = struct {
 
         // Initialize window manager
         var window_manager = try WindowManager.init(allocator, ws.ws_col, ws.ws_row);
-        errdefer window_manager.deinit();
+        errdefer window_manager.deinit(io);
 
         // Create a centered floating window (80% of terminal size)
         const float_width = (ws.ws_col * 80) / 100;
@@ -607,15 +613,16 @@ const TermProxy = struct {
         floating_win.visible = false; // Start hidden
 
         // Spawn a shell in the floating window
-        try floating_win.spawnShell();
+        try floating_win.spawnShell(io);
 
         return TermProxy{
+            .io = io,
             .allocator = allocator,
             .master_fd = master_fd,
-            .child_pid = pid,
+            .child_pid = @intCast(pid_c),
             .window_manager = window_manager,
             .original_termios = original_termios,
-            .stdout = std.fs.File{ .handle = std.posix.STDOUT_FILENO },
+            .stdout = std.Io.File.stdout(),
             .term_cols = ws.ws_col,
             .term_rows = ws.ws_row,
         };
@@ -623,19 +630,19 @@ const TermProxy = struct {
 
     fn deinit(self: *TermProxy) void {
         // Restore terminal
-        const stdin_fd = std.posix.STDIN_FILENO;
+        const stdin_fd = std.Io.File.stdin().handle;
         posix.tcsetattr(stdin_fd, .FLUSH, self.original_termios) catch {};
 
-        posix.close(self.master_fd);
-        self.window_manager.deinit();
+        closeFd(self.io, self.master_fd);
+        self.window_manager.deinit(self.io);
     }
 
     fn run(self: *TermProxy) !void {
-        const stdin = std.fs.File{ .handle = std.posix.STDIN_FILENO };
+        const stdin = std.Io.File.stdin();
         var buf: [4096]u8 = undefined;
 
         // Clear screen and move cursor to top-left so everything starts fresh
-        self.stdout.writeAll("\x1b[2J\x1b[H") catch {};
+        self.stdout.writeStreamingAll(self.io, "\x1b[2J\x1b[H") catch {};
 
         // Create vtStream for parsing terminal output (main window)
         // Main window uses simple ReadonlyStream - queries passthrough to real terminal
@@ -676,7 +683,7 @@ const TermProxy = struct {
                 if (n == 0) break;
 
                 // Update main window's terminal state
-                try main_stream.nextSlice(buf[0..n]);
+                main_stream.nextSlice(buf[0..n]);
 
                 if (self.floating_window_visible) {
                     // When floating window visible, we're in alternate screen
@@ -684,7 +691,7 @@ const TermProxy = struct {
                     try self.renderAll();
                 } else {
                     // Pass through directly - preserves colors, cursor, terminal queries
-                    self.stdout.writeAll(buf[0..n]) catch break;
+                    self.stdout.writeStreamingAll(self.io, buf[0..n]) catch break;
                 }
             }
 
@@ -699,7 +706,7 @@ const TermProxy = struct {
                     // VTHandler automatically handles:
                     // - Title changes (window_title action -> onWindowTitle)
                     // - Device queries (device_attributes action -> onDeviceQuery)
-                    try floating_stream.nextSlice(buf[0..n]);
+                    floating_stream.nextSlice(buf[0..n]);
 
                     // Re-render if visible
                     if (self.floating_window_visible) {
@@ -722,7 +729,7 @@ const TermProxy = struct {
                         const last = buf[n - 1];
                         if (last == 'c' or last == 'n' or last == 'R') {
                             // This is a terminal response, send to the PTY that requested it
-                            _ = posix.write(query_pty, buf[0..n]) catch {};
+                            writeAllFd(self.io, query_pty, buf[0..n]) catch {};
                             self.pending_query_pty = null;
                             continue;
                         }
@@ -753,7 +760,7 @@ const TermProxy = struct {
                         continue;
                     }
                     // Not '[', send the Ctrl+b and the key to the shell
-                    _ = posix.write(self.master_fd, &[_]u8{0x02}) catch break;
+                    writeAllFd(self.io, self.master_fd, &[_]u8{0x02}) catch break;
                     // Fall through to send the current key
                 }
 
@@ -785,10 +792,10 @@ const TermProxy = struct {
                 // Route input based on which window is focused
                 if (self.floating_window_visible) {
                     // Send input to floating shell
-                    _ = posix.write(floating_pty_fd, buf[0..n]) catch {};
+                    writeAllFd(self.io, floating_pty_fd, buf[0..n]) catch {};
                 } else {
                     // Send input to main shell
-                    _ = posix.write(self.master_fd, buf[0..n]) catch break;
+                    writeAllFd(self.io, self.master_fd, buf[0..n]) catch break;
                 }
             }
 
@@ -823,9 +830,9 @@ const TermProxy = struct {
                 const n = posix.read(self.master_fd, &buf) catch break;
                 if (n == 0) break;
                 // Update buffer
-                try stream.nextSlice(buf[0..n]);
+                stream.nextSlice(buf[0..n]);
                 // Also pass through to real terminal (before we enter alternate)
-                self.stdout.writeAll(buf[0..n]) catch break;
+                self.stdout.writeStreamingAll(self.io, buf[0..n]) catch break;
             } else {
                 break;
             }
@@ -833,13 +840,13 @@ const TermProxy = struct {
     }
 
     fn enterAlternateScreen(self: *TermProxy) !void {
-        var stdout_writer = self.stdout.writer(&self.write_buf);
+        var stdout_writer = self.stdout.writer(self.io, &self.write_buf);
         try stdout_writer.interface.writeAll("\x1b[?1049h"); // Enter alternate screen
         try stdout_writer.interface.flush();
     }
 
     fn exitAlternateScreen(self: *TermProxy) !void {
-        var stdout_writer = self.stdout.writer(&self.write_buf);
+        var stdout_writer = self.stdout.writer(self.io, &self.write_buf);
         try stdout_writer.interface.writeAll("\x1b[?1049l"); // Exit alternate screen
         try stdout_writer.interface.flush();
 
@@ -849,7 +856,7 @@ const TermProxy = struct {
     }
 
     fn renderAll(self: *TermProxy) !void {
-        var stdout_writer = self.stdout.writer(&self.write_buf);
+        var stdout_writer = self.stdout.writer(self.io, &self.write_buf);
 
         // Hide cursor during rendering
         try stdout_writer.interface.writeAll("\x1b[?25l");
@@ -883,7 +890,7 @@ const TermProxy = struct {
     }
 
     fn renderMainWindowOnly(self: *TermProxy) !void {
-        var stdout_writer = self.stdout.writer(&self.write_buf);
+        var stdout_writer = self.stdout.writer(self.io, &self.write_buf);
 
         // Hide cursor during rendering
         try stdout_writer.interface.writeAll("\x1b[?25l");
@@ -903,7 +910,7 @@ const TermProxy = struct {
 
         // Scroll viewport to top of scrollback
         const terminal = &self.window_manager.main_window.terminal;
-        try terminal.scrollViewport(.top);
+        terminal.scrollViewport(.top);
 
         // Enter alternate screen and render
         try self.enterAlternateScreen();
@@ -915,7 +922,7 @@ const TermProxy = struct {
 
         // Scroll viewport back to bottom (active area)
         const terminal = &self.window_manager.main_window.terminal;
-        try terminal.scrollViewport(.bottom);
+        terminal.scrollViewport(.bottom);
 
         // Exit alternate screen - shell will redraw
         try self.exitAlternateScreen();
@@ -934,34 +941,34 @@ const TermProxy = struct {
                     return true;
                 },
                 'j' => { // Scroll down one line
-                    try terminal.scrollViewport(.{ .delta = 1 });
+                    terminal.scrollViewport(.{ .delta = 1 });
                     try self.renderScrollback();
                     return true;
                 },
                 'k' => { // Scroll up one line
-                    try terminal.scrollViewport(.{ .delta = -1 });
+                    terminal.scrollViewport(.{ .delta = -1 });
                     try self.renderScrollback();
                     return true;
                 },
                 'g' => { // Go to top
-                    try terminal.scrollViewport(.top);
+                    terminal.scrollViewport(.top);
                     try self.renderScrollback();
                     return true;
                 },
                 'G' => { // Go to bottom
-                    try terminal.scrollViewport(.bottom);
+                    terminal.scrollViewport(.bottom);
                     try self.renderScrollback();
                     return true;
                 },
                 0x04 => { // Ctrl+d - half page down
                     const half_page: isize = @intCast(self.term_rows / 2);
-                    try terminal.scrollViewport(.{ .delta = half_page });
+                    terminal.scrollViewport(.{ .delta = half_page });
                     try self.renderScrollback();
                     return true;
                 },
                 0x15 => { // Ctrl+u - half page up
                     const half_page: isize = @intCast(self.term_rows / 2);
-                    try terminal.scrollViewport(.{ .delta = -half_page });
+                    terminal.scrollViewport(.{ .delta = -half_page });
                     try self.renderScrollback();
                     return true;
                 },
@@ -974,7 +981,7 @@ const TermProxy = struct {
     }
 
     fn renderScrollback(self: *TermProxy) !void {
-        var stdout_writer = self.stdout.writer(&self.write_buf);
+        var stdout_writer = self.stdout.writer(self.io, &self.write_buf);
 
         // Hide cursor during rendering
         try stdout_writer.interface.writeAll("\x1b[?25l");
@@ -1020,21 +1027,23 @@ fn ptsname_wrapper(fd: posix.fd_t) [:0]const u8 {
     return std.mem.span(ptr);
 }
 
-pub fn main() !u8 {
+pub fn main(init: std.process.Init) !u8 {
+    const io = init.io;
+
     var stdout_buf: [4096]u8 = undefined;
     var stderr_buf: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
+    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buf);
     const stdout = &stdout_writer.interface;
     const stderr = &stderr_writer.interface;
 
-    // Parse CLI arguments
-    const args = std.process.argsAlloc(std.heap.page_allocator) catch {
+    // Parse CLI arguments. The arena lives until the end of main, so we
+    // can hand its slices straight to cli.parse.
+    const args = init.minimal.args.toSlice(init.arena.allocator()) catch {
         stderr.writeAll("error: failed to allocate arguments\n") catch {};
         stderr.flush() catch {};
         return 1;
     };
-    defer std.process.argsFree(std.heap.page_allocator, args);
 
     const action = cli.parse(args[1..]) catch {
         stderr.writeAll("error: invalid argument\n") catch {};
@@ -1057,12 +1066,15 @@ pub fn main() !u8 {
         .run => {},
     }
 
-    // Run the terminal proxy
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    // Run the terminal proxy. tzig: prefer the gpa from init.gpa where
+    // possible; we still use a per-process DebugAllocator here so our leak
+    // checks stay tight in debug builds.
+    _ = init.gpa;
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var proxy = TermProxy.init(allocator) catch |err| {
+    var proxy = TermProxy.init(io, allocator) catch |err| {
         stderr.print("error: failed to initialize terminal: {}\n", .{err}) catch {};
         stderr.flush() catch {};
         return 1;

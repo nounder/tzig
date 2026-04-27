@@ -25,6 +25,16 @@ pub fn VTHandler(comptime Context: type) type {
             self: *Self,
             comptime action: Action.Tag,
             value: Action.Value(action),
+        ) void {
+            self.vtFallible(action, value) catch |err| {
+                std.log.warn("error handling VT action action={} err={}", .{ action, err });
+            };
+        }
+
+        inline fn vtFallible(
+            self: *Self,
+            comptime action: Action.Tag,
+            value: Action.Value(action),
         ) !void {
             switch (action) {
                 // Terminal state modifications - delegate to terminal
@@ -106,7 +116,7 @@ pub fn VTHandler(comptime Context: type) type {
                     }
                 },
                 .save_cursor => self.terminal.saveCursor(),
-                .restore_cursor => try self.terminal.restoreCursor(),
+                .restore_cursor => self.terminal.restoreCursor(),
                 .invoke_charset => self.terminal.invokeCharset(value.bank, value.charset, value.locking),
                 .configure_charset => self.terminal.configureCharset(value.slot, value.charset),
                 .set_attribute => switch (value) {
@@ -134,14 +144,7 @@ pub fn VTHandler(comptime Context: type) type {
                 .full_reset => self.terminal.fullReset(),
                 .start_hyperlink => try self.terminal.screens.active.startHyperlink(value.uri, value.id),
                 .end_hyperlink => self.terminal.screens.active.endHyperlink(),
-                .prompt_start => {
-                    self.terminal.screens.active.cursor.page_row.semantic_prompt = .prompt;
-                    self.terminal.flags.shell_redraws_prompt = value.redraw;
-                },
-                .prompt_continuation => self.terminal.screens.active.cursor.page_row.semantic_prompt = .prompt_continuation,
-                .prompt_end => self.terminal.markSemanticPrompt(.input),
-                .end_of_input => self.terminal.markSemanticPrompt(.command),
-                .end_of_command => self.terminal.screens.active.cursor.page_row.semantic_prompt = .input,
+                .semantic_prompt => try self.terminal.semanticPrompt(value),
                 .mouse_shape => self.terminal.mouse_shape = value,
                 .color_operation => try self.colorOperation(value.op, &value.requests),
                 .kitty_color_report => try self.kittyColorOperation(value),
@@ -168,7 +171,7 @@ pub fn VTHandler(comptime Context: type) type {
         inline fn horizontalTab(self: *Self, count: u16) !void {
             for (0..count) |_| {
                 const x = self.terminal.screens.active.cursor.x;
-                try self.terminal.horizontalTab();
+                self.terminal.horizontalTab();
                 if (x == self.terminal.screens.active.cursor.x) break;
             }
         }
@@ -176,7 +179,7 @@ pub fn VTHandler(comptime Context: type) type {
         inline fn horizontalTabBack(self: *Self, count: u16) !void {
             for (0..count) |_| {
                 const x = self.terminal.screens.active.cursor.x;
-                try self.terminal.horizontalTabBack();
+                self.terminal.horizontalTabBack();
                 if (x == self.terminal.screens.active.cursor.x) break;
             }
         }
@@ -197,7 +200,7 @@ pub fn VTHandler(comptime Context: type) type {
                 .save_cursor => if (enabled) {
                     self.terminal.saveCursor();
                 } else {
-                    try self.terminal.restoreCursor();
+                    self.terminal.restoreCursor();
                 },
                 .enable_mode_3 => {},
                 .@"132_column" => try self.terminal.deccolm(
@@ -219,11 +222,10 @@ pub fn VTHandler(comptime Context: type) type {
 
         fn colorOperation(self: *Self, op: anytype, requests: anytype) !void {
             _ = op;
-            if (requests.count() == 0) return;
+            if (requests.items.len == 0) return;
 
-            var it = requests.constIterator(0);
-            while (it.next()) |req| {
-                switch (req.*) {
+            for (requests.items) |req| {
+                switch (req) {
                     .set => |set| {
                         switch (set.target) {
                             .palette => |i| {

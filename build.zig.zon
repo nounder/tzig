@@ -2,16 +2,22 @@
     .name = .tzig,
     .version = "0.0.0",
     .fingerprint = 0xfb962144be67ed1b,
-    .minimum_zig_version = "0.15.1",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        .ghostty = .{
-            .path = "vendor/ghostty",
+        // Unicode width / property data. Pinned at commit 2826a37a, which
+        // is the merge of jacobsandlund/uucode's `zig-0.16` branch into main
+        // (Zig 0.16-compatible). This is newer than the v0.2.0 release that
+        // upstream ghostty pins; the API differs from the v0.2.0 form
+        // documented in src/build/uucode_config.zig (see that file's notes
+        // on what we adapted).
+        .uucode = .{
+            .url = "https://github.com/jacobsandlund/uucode/archive/2826a37a4562284fdacd8fa029d49509cc9bffcd.tar.gz",
+            .hash = "uucode-0.2.0-ZZjBPlK5VADj7fdoq7G8LIHzD5o6FSkcBXXrRWr4jnrA",
         },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
-        "vendor",
     },
 }

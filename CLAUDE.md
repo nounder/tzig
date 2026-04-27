@@ -17,33 +17,56 @@ zig build test     # Run tests
 
 The built binary is at `./zig-out/bin/tzig`.
 
-## Zig 0.15+ API Notes
+## Zig 0.16 API Notes
 
-This project uses Zig 0.15+. Key API differences from older versions:
+This project targets Zig 0.16. Most of the I/O surface moved from
+`std.fs` to `std.Io`. Key differences:
+
+### Entry point shape
+
+```zig
+pub fn main(init: std.process.Init) !u8 {
+    const io = init.io;
+    // ...
+}
+```
+`init.io`, `init.gpa`, `init.arena`, and `init.minimal.{environ,args}` are
+your entry points to the rest of stdlib. See
+`/opt/homebrew/Cellar/zig/0.16.0/lib/zig/std/process.zig` `Init` struct.
 
 ### File I/O Writers
-Writers require a buffer parameter:
+Writers require an `io` and a buffer parameter:
 ```zig
-// Correct for Zig 0.15+
 var buf: [4096]u8 = undefined;
-var writer = std.fs.File.stdout().writer(&buf);
+var writer = std.Io.File.stdout().writer(io, &buf);
 const w = &writer.interface;
 try w.writeAll("hello");
 try w.flush();  // Don't forget to flush!
-
-// Wrong (old API)
-const writer = std.io.getStdOut().writer();  // Does not exist
 ```
 
 ### Static file handles
 ```zig
-// Correct
-const stdout = std.fs.File.stdout();
-const stderr = std.fs.File.stderr();
-
-// Wrong (old API)
-std.io.getStdOut()  // Does not exist
+const stdout = std.Io.File.stdout();
+const stderr = std.Io.File.stderr();
+const stdin  = std.Io.File.stdin();
+// .handle gives you the raw `posix.fd_t`.
 ```
+
+`std.fs.File.stdout()` does NOT exist in 0.16 (despite what some early
+0.16 reference docs claim). Use `std.Io.File.stdout()`.
+
+### Removed `std.posix.*` symbols
+
+Many syscall wrappers were removed in 0.16. Common replacements:
+
+- `posix.open` -> `std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write })`
+- `posix.close(fd)` -> wrap in `std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } }` and call `.close(io)`
+- `posix.write` -> `Io.File.writeStreamingAll(io, bytes)` on a wrapper File
+- `posix.read` -> still exists, no change needed
+- `posix.fork`, `posix.exit`, `posix.dup2`, `posix.execvpeZ` -> drop to `std.c.*` (these don't fit the Io model)
+- `posix.getenv` -> `init.minimal.environ.getPosix("X")` returning `?[:0]const u8`
+
+See `src/vt/PORT_LESSONS.md` for the full mapping table and rationale.
 
 ## Project Structure
 
